@@ -1,0 +1,42 @@
+# Binaries for programs and plugins
+*.o
+*.a
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*-meta.json
+*.txt
+*.crt
+*.key
+*.pem
+*.csr
+*.crt
+*.prof
+.DS_Store
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor directories and files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
