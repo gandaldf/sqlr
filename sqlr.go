@@ -327,7 +327,7 @@ func (b *Builder) ScanOneContext(ctx context.Context, db Queryer, dest any) erro
 		}
 		return sql.ErrNoRows
 	}
-	if err := scanInto(rows, dest); err != nil {
+	if err := scanOne(rows, dest); err != nil {
 		return err
 	}
 

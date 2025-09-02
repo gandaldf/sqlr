@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -818,6 +819,87 @@ func TestMapper_ScanAll_Flatten_NestedPtr_ResetPerRow(t *testing.T) {
 	}
 }
 
+// TestMapper_ScanAll_ResetLen_ReusesCap_SliceOfStruct tests that when
+// ScanAll is given a pre-allocated slice of structs with len>0, it resets
+// the length to zero and reuses the existing capacity.
+func TestMapper_ScanAll_ResetLen_ReusesCap_SliceOfStruct(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+
+	rows := sqlmock.NewRows([]string{"id", "name"}).
+		AddRow(1, "a").
+		AddRow(2, "b").
+		AddRow(3, "c")
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	sentinel := Row{ID: 99, Name: "SENTINEL"}
+	out := make([]Row, 2, 5)
+	out[0], out[1] = sentinel, sentinel
+
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if got := len(out); got != 3 {
+		t.Fatalf("len(out)=%d, want 3", got)
+	}
+	if got := cap(out); got != 5 {
+		t.Fatalf("cap(out)=%d, want 5 (cap riusata)", got)
+	}
+	if out[0].ID != 1 || out[0].Name != "a" || out[1].ID != 2 || out[2].ID != 3 {
+		t.Fatalf("contenuto errato dopo reset+scan: %+v", out)
+	}
+}
+
+// TestMapper_ScanAll_SliceOfPtrStruct_ScannerAndPtr_WithSinkAndReset tests
+// that ScanAll can reuse a slice of pointer-to-struct with pre-allocated
+// elements, resetting each element and reusing capacity.
+func TestMapper_ScanAll_SliceOfPtrStruct_ScannerAndPtr_WithSinkAndReset(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Row struct {
+		U Upper `db:"u"` // ckScanner
+		P *int  `db:"p"` // ckPtr
+	}
+
+	rows := sqlmock.NewRows([]string{"u", "ignored", "p"}).
+		AddRow("ciao", "dropme", 7).
+		AddRow("x", "also_drop", nil)
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	s := &Row{U: Upper("SENT"), P: new(int)}
+	out := make([]*Row, 1, 4)
+	out[0] = s
+
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if got := len(out); got != 2 {
+		t.Fatalf("len(out)=%d, want 2", got)
+	}
+	if got := cap(out); got != 4 {
+		t.Fatalf("cap(out)=%d, want 4 (cap riusata)", got)
+	}
+
+	if out[0] == nil || out[0].U != Upper("CIAO") {
+		t.Fatalf("row0.U scanner non applicato: %+v", out[0])
+	}
+	if out[0].P == nil || *out[0].P != 7 {
+		t.Fatalf("row0.P atteso 7, got=%v", out[0].P)
+	}
+	if out[1] == nil || out[1].U != Upper("X") {
+		t.Fatalf("row1.U scanner non applicato: %+v", out[1])
+	}
+	if out[1].P != nil {
+		t.Fatalf("row1.P atteso nil, got=%v", *out[1].P)
+	}
+}
+
 // TestMapper_Scan_Flatten_ScannerLeafInNested checks that scanner-typed
 // leaves inside nested structs are correctly scanned.
 func TestMapper_Scan_Flatten_ScannerLeafInNested(t *testing.T) {
@@ -899,18 +981,245 @@ func TestScanAll_AmbiguousField_InMakeScanPlan_AllDialects(t *testing.T) {
 	}
 }
 
-// TestMakeScanPlan_AmbiguousField_Direct is a unit-level test of makeScanPlan
-// that checks ambiguity is detected even without running a query.
-func TestMakeScanPlan_AmbiguousField_Direct(t *testing.T) {
+// TestBuildScanPlan_AmbiguousField_Direct checks that ambiguity is detected
+// when two fields map to the same column name, without running a query.
+func TestBuildScanPlan_AmbiguousField_Direct(t *testing.T) {
 	type Amb struct {
 		X int `db:"id"`
 		Y int `db:"id"`
 	}
 	cols := []string{"id"}
 
-	_, err := makeScanPlan(cols, reflect.TypeOf(Amb{}))
+	_, err := buildScanPlan(cols, reflect.TypeOf(Amb{}))
 	if err == nil || !errors.Is(err, ErrFieldAmbiguous) {
 		t.Fatalf("expected ErrFieldAmbiguous, got: %v", err)
+	}
+}
+
+// TestGetScanPlan_CacheHitSamePointer ensures that requesting the same plan
+// (same destination struct type and same ordered columns) returns the same pointer.
+func TestGetScanPlan_CacheHitSamePointer(t *testing.T) {
+	type Row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	cols := []string{"id", "name"}
+
+	p1, err := getScanPlan(cols, reflect.TypeOf(Row{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	p2, err := getScanPlan(cols, reflect.TypeOf(Row{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p1 != p2 {
+		t.Fatalf("expected same plan pointer from cache, got different pointers")
+	}
+}
+
+// TestGetScanPlan_DifferentColumnsDifferentPlan ensures that different column
+// signatures lead to different cached plans.
+func TestGetScanPlan_DifferentColumnsDifferentPlan(t *testing.T) {
+	type Row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+	cols1 := []string{"id", "name"}
+	cols2 := []string{"name", "id"} // order matters
+
+	p1, err := getScanPlan(cols1, reflect.TypeOf(Row{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	p2, err := getScanPlan(cols2, reflect.TypeOf(Row{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p1 == p2 {
+		t.Fatalf("expected different plan pointers for different column signatures")
+	}
+}
+
+// TestGetScanPlan_PointerAndValueSamePlan ensures that passing a pointer type or a
+// value type for the destination results in the same canonical plan.
+func TestGetScanPlan_PointerAndValueSamePlan(t *testing.T) {
+	type Row struct {
+		ID int `db:"id"`
+	}
+	cols := []string{"id"}
+
+	pVal, err := getScanPlan(cols, reflect.TypeOf(Row{}))
+	if err != nil {
+		t.Fatalf("unexpected error (value): %v", err)
+	}
+	pPtr, err := getScanPlan(cols, reflect.TypeOf(&Row{}))
+	if err != nil {
+		t.Fatalf("unexpected error (pointer): %v", err)
+	}
+	if pVal != pPtr {
+		t.Fatalf("expected same plan pointer for value and pointer destination types")
+	}
+}
+
+// TestGetScanPlan_Concurrent checks that concurrent access to the plan cache
+// does not race and consistently returns non-nil plans.
+func TestGetScanPlan_Concurrent(t *testing.T) {
+	type Row struct {
+		A int    `db:"a"`
+		B string `db:"b"`
+	}
+	cols := []string{"a", "b"}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 50)
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, err := getScanPlan(cols, reflect.TypeOf(Row{}))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if p == nil {
+				errCh <- errors.New("nil plan returned")
+				return
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent getScanPlan failed: %v", err)
+		}
+	}
+}
+
+// TestPlanCache_Get_PromotesFromPrev verifies that when a key is found in the
+// previous generation (prev), get() promotes it into the current generation (curr)
+// without rotating (when curr is not full).
+func TestPlanCache_Get_PromotesFromPrev(t *testing.T) {
+	pc := newPlanCache(2) // small max to control rotations
+	p1 := &scanPlan{}
+	p2 := &scanPlan{}
+	p3 := &scanPlan{}
+
+	// Create three distinct keys so that after the third put:
+	// prev = {k1, k2}, curr = {k3}
+	k1 := planKey{dstType: reflect.TypeOf(struct{ A int }{}), sig: "id"}
+	k2 := planKey{dstType: reflect.TypeOf(struct{ B int }{}), sig: "id"}
+	k3 := planKey{dstType: reflect.TypeOf(struct{ C int }{}), sig: "id"}
+
+	// Fill curr to capacity, then trigger rotation on the third put.
+	pc.put(k1, p1) // curr = {k1}
+	pc.put(k2, p2) // curr = {k1, k2}
+	pc.put(k3, p3) // rotation: prev = {k1, k2}, curr = {k3}
+
+	// Sanity check preconditions.
+	if len(pc.prev) != 2 || len(pc.curr) != 1 {
+		t.Fatalf("precondition failed: expected prev=2, curr=1; got prev=%d curr=%d", len(pc.prev), len(pc.curr))
+	}
+
+	// Now get(k1): it must be found in prev and promoted into curr (no rotation).
+	got, ok := pc.get(k1)
+	if !ok || got != p1 {
+		t.Fatalf("expected promotion hit for k1 with p1, got ok=%v plan=%p", ok, got)
+	}
+
+	// After promotion, curr should contain k1 in addition to k3.
+	if _, ok := pc.curr[k1]; !ok {
+		t.Fatalf("expected k1 to be promoted into curr")
+	}
+	if _, ok := pc.curr[k3]; !ok {
+		t.Fatalf("expected k3 to remain in curr")
+	}
+
+	// We do not require removal from prev (promotion duplicates, consistent with fieldCache).
+	if _, ok := pc.prev[k1]; !ok {
+		t.Fatalf("expected k1 to still exist in prev (promotion does not delete)")
+	}
+}
+
+// TestPlanCache_Get_RotatesOnPromotionWhenCurrFull verifies that if curr is full
+// at the moment we promote from prev, get() performs a rotation (prev <- curr, curr reset)
+// before inserting the promoted entry.
+func TestPlanCache_Get_RotatesOnPromotionWhenCurrFull(t *testing.T) {
+	pc := newPlanCache(1) // max=1 ensures curr is "full" with a single entry
+	pA := &scanPlan{}
+	pB := &scanPlan{}
+
+	kA := planKey{dstType: reflect.TypeOf(struct{ A int }{}), sig: "col"}
+	kB := planKey{dstType: reflect.TypeOf(struct{ B int }{}), sig: "col"}
+
+	// Put A → curr={A}
+	pc.put(kA, pA)
+	// Put B → rotation on put: prev={A}, curr={B}
+	pc.put(kB, pB)
+
+	// Sanity check preconditions.
+	if len(pc.prev) != 1 || len(pc.curr) != 1 {
+		t.Fatalf("precondition failed: expected prev=1, curr=1; got prev=%d curr=%d", len(pc.prev), len(pc.curr))
+	}
+	if _, ok := pc.prev[kA]; !ok {
+		t.Fatalf("expected kA in prev before promotion")
+	}
+	if _, ok := pc.curr[kB]; !ok {
+		t.Fatalf("expected kB in curr before promotion")
+	}
+
+	// Now promote A from prev while curr is full.
+	got, ok := pc.get(kA)
+	if !ok || got != pA {
+		t.Fatalf("expected promotion of kA with pA, got ok=%v plan=%p", ok, got)
+	}
+
+	// Because curr was full at promotion time, get() should have rotated:
+	// new prev = old curr ({kB}), new curr = {kA}
+	if len(pc.curr) != 1 || len(pc.prev) != 1 {
+		t.Fatalf("after promotion-rotation: expected prev=1, curr=1; got prev=%d curr=%d", len(pc.prev), len(pc.curr))
+	}
+	if _, ok := pc.curr[kA]; !ok {
+		t.Fatalf("expected kA to be in curr after rotation")
+	}
+	if _, ok := pc.prev[kB]; !ok {
+		t.Fatalf("expected kB to be in prev after rotation")
+	}
+}
+
+// TestScanAllRowsLike_WithPlanCache is a small integration test exercising the cached plan
+// by scanning two rows into a slice of structs and a slice of *structs.
+func TestScanAllRowsLike_WithPlanCache(t *testing.T) {
+	type Row struct {
+		ID   int    `db:"id"`
+		Name string `db:"name"`
+	}
+
+	// rowsLike is assumed to be your existing test double with fields:
+	//   cols []string
+	// and methods:
+	//   Next() bool
+	//   Scan(...any) error
+	//   Err() error
+	r1 := &rowsLike{
+		cols: []string{"id", "name"},
+		// configure your rows data here...
+	}
+	var out1 []Row
+	if err := scanAllRowsLike(r1, &out1); err != nil {
+		t.Fatalf("unexpected error scanning into []Row: %v", err)
+	}
+
+	r2 := &rowsLike{
+		cols: []string{"id", "name"},
+		// same data reused to exercise cache hit
+	}
+	var out2 []*Row
+	if err := scanAllRowsLike(r2, &out2); err != nil {
+		t.Fatalf("unexpected error scanning into []*Row: %v", err)
 	}
 }
 
@@ -1001,60 +1310,105 @@ func (r *rowsLike) Scan(dest ...any) error {
 func (r *rowsLike) Err() error   { return nil }
 func (r *rowsLike) Close() error { return nil }
 
+// scanAllRowsLike scans rows from a rows-like test double into dest using the cached scan plan.
+// It mirrors the production ScanAll path but works against a test stub (rowsLike).
 func scanAllRowsLike(rows *rowsLike, dest any) error {
 	rv := reflect.ValueOf(dest)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return fmt.Errorf("scanAllRowsLike: dest must be a non-nil pointer to slice")
+	}
 	rv = rv.Elem()
+	if rv.Kind() != reflect.Slice {
+		return fmt.Errorf("scanAllRowsLike: dest must be a pointer to slice")
+	}
+
+	if rv.Len() != 0 {
+		rv.Set(rv.Slice(0, 0))
+	}
+
 	elemT := rv.Type().Elem()
+	cols := rows.cols
 
 	switch elemT.Kind() {
 	case reflect.Struct, reflect.Pointer:
 		isPtr := elemT.Kind() == reflect.Pointer
-		structT := elemT
+		var structT reflect.Type
 		if isPtr {
+			if elemT.Elem().Kind() != reflect.Struct {
+				return fmt.Errorf("scanAllRowsLike: slice of pointers to non-struct")
+			}
 			structT = elemT.Elem()
+		} else {
+			structT = elemT
 		}
 
-		cols := rows.cols
-		plan, err := makeScanPlan(cols, structT) // <-- now returns (*scanPlan, error)
+		plan, err := getScanPlan(cols, structT)
 		if err != nil {
 			return err
 		}
+		st := plan.newState()
 
 		for rows.Next() {
-			elem := reflect.New(structT).Elem()
-
-			for i := range cols {
-				switch plan.kinds[i] {
-				case ckSink:
-					plan.targets[i] = plan.sinks[i]
-				case ckScanner, ckValue:
-					// Allocate intermediates along the path and address the leaf
-					fv := fieldByIndexAlloc(elem, plan.fPath[i])
-					plan.targets[i] = fv.Addr().Interface()
-				case ckPtr:
-					// **T holder reused (as in production code)
-					h := plan.holders[i]
-					h.Elem().SetZero()
-					plan.targets[i] = h.Interface()
-				}
-			}
-			if err := rows.Scan(plan.targets...); err != nil {
-				return err
-			}
-			// Copy *T into pointer fields allocating intermediates if needed
-			for _, i := range plan.ptrIdx {
-				setFieldByIndex(elem, plan.fPath[i], plan.holders[i].Elem())
-			}
 			if isPtr {
-				rv.Set(reflect.Append(rv, elem.Addr()))
+				// []*Struct: create *Struct, scan into Elem, then append the pointer
+				ptr := reflect.New(structT)
+				dst := ptr.Elem()
+
+				for i := range cols {
+					switch plan.kinds[i] {
+					case ckSink:
+						st.targets[i] = st.sinks[i]
+					case ckScanner, ckValue:
+						fv := fieldByIndexAlloc(dst, plan.fPath[i])
+						st.targets[i] = fv.Addr().Interface()
+					case ckPtr:
+						h := st.holders[i]
+						h.Elem().SetZero()
+						st.targets[i] = h.Interface()
+					}
+				}
+
+				if err := rows.Scan(st.targets...); err != nil {
+					return err
+				}
+				for _, i := range plan.ptrIdx {
+					setFieldByIndex(dst, plan.fPath[i], st.holders[i].Elem())
+				}
+				rv.Set(reflect.Append(rv, ptr))
 			} else {
-				rv.Set(reflect.Append(rv, elem))
+				// []Struct: append zero element first, then populate in place
+				rv.Set(reflect.Append(rv, reflect.Zero(structT)))
+				dst := rv.Index(rv.Len() - 1)
+
+				for i := range cols {
+					switch plan.kinds[i] {
+					case ckSink:
+						st.targets[i] = st.sinks[i]
+					case ckScanner, ckValue:
+						fv := fieldByIndexAlloc(dst, plan.fPath[i])
+						st.targets[i] = fv.Addr().Interface()
+					case ckPtr:
+						h := st.holders[i]
+						h.Elem().SetZero()
+						st.targets[i] = h.Interface()
+					}
+				}
+
+				if err := rows.Scan(st.targets...); err != nil {
+					return err
+				}
+				for _, i := range plan.ptrIdx {
+					setFieldByIndex(dst, plan.fPath[i], st.holders[i].Elem())
+				}
 			}
 		}
 		return rows.Err()
 
 	default:
-		// primitives: 1 column
+		// Primitive/Scanner → must be 1 column
+		if len(cols) != 1 {
+			return fmt.Errorf("scanAllRowsLike: non-struct slice requires exactly 1 column, got %d", len(cols))
+		}
 		for rows.Next() {
 			item := reflect.New(elemT).Elem()
 			if err := rows.Scan(item.Addr().Interface()); err != nil {

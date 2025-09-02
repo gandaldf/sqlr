@@ -9,23 +9,6 @@ import (
 	"sync"
 )
 
-// fieldInfo describes a leaf field: its full index path and whether it's marked
-// as "scalar" via tag option (no slice expansion).
-type fieldInfo struct {
-	index     []int // full index path for FieldByIndex-like ops
-	scalar    bool
-	ambiguous bool // true if multiple fields with same name found (only for top-level fields)
-}
-
-// fieldCache implements a two-tier map with cheap rotation to bound memory.
-// 'curr' is the hot set; 'prev' is the previous generation. Lookups promote.
-type fieldCache struct {
-	mu   sync.RWMutex
-	curr map[reflect.Type]map[string]fieldInfo
-	prev map[reflect.Type]map[string]fieldInfo
-	max  int
-}
-
 // scalar is a wrapper to force scalar binding semantics.
 type scalar struct {
 	v any
@@ -828,6 +811,23 @@ func appendIndex(path []int, idx int) []int {
 // --------------------------------
 // Cache
 // --------------------------------
+
+// fieldInfo describes a leaf field: its full index path and whether it's marked
+// as "scalar" via tag option (no slice expansion).
+type fieldInfo struct {
+	index     []int // full index path for FieldByIndex-like ops
+	scalar    bool
+	ambiguous bool // true if multiple fields with same name found (only for top-level fields)
+}
+
+// fieldCache implements a two-tier map with cheap rotation to bound memory.
+// 'curr' is the hot set; 'prev' is the previous generation. Lookups promote.
+type fieldCache struct {
+	mu   sync.RWMutex
+	curr map[reflect.Type]map[string]fieldInfo
+	prev map[reflect.Type]map[string]fieldInfo
+	max  int
+}
 
 // newFieldCache creates a new simple two-tier cache with cheap rotation to limit memory usage.
 func newFieldCache(max int) *fieldCache {
