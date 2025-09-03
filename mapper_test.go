@@ -566,6 +566,283 @@ func TestMapper_ScanAll_PointerToScannerType(t *testing.T) {
 	}
 }
 
+// TestMapper_ScanAll_SliceOfPtrStruct_PointerToScannerType ensures that when
+// scanning into a slice of *struct and the destination field is *T where *T
+// implements sql.Scanner, we capture the raw value into a sink, then post-process:
+// - allocate *T and call Scan for non-NULL
+// - keep nil for NULL.
+func TestMapper_ScanAll_SliceOfPtrStruct_PointerToScannerType(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Row struct {
+		U *Upper `db:"u"` // *Upper implements sql.Scanner
+	}
+
+	rows := sqlmock.NewRows([]string{"u"}).
+		AddRow("hello").
+		AddRow(nil)
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	var out []*Row
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out)=%d, want 2", len(out))
+	}
+	if out[0] == nil || out[0].U == nil || *out[0].U != Upper("HELLO") {
+		t.Fatalf("row0.U got=%v, want *Upper(\"HELLO\")", out[0].U)
+	}
+	if out[1] == nil || out[1].U != nil {
+		t.Fatalf("row1.U should be nil, got=%v", out[1].U)
+	}
+}
+
+// TestMapper_ScanAll_SliceOfPtrStruct_ValueScannerViaPtrReceiver ensures that when
+// scanning into a slice of *struct and the destination field is a value T whose *T
+// implements sql.Scanner (pointer receiver), we pass &T directly to rows.Scan.
+func TestMapper_ScanAll_SliceOfPtrStruct_ValueScannerViaPtrReceiver(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Row struct {
+		Up Upper `db:"up"` // value field; *Upper implements sql.Scanner
+	}
+
+	rows := sqlmock.NewRows([]string{"up"}).
+		AddRow("ciao").
+		AddRow([]byte("hey"))
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	var out []*Row
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out)=%d, want 2", len(out))
+	}
+	if out[0] == nil || out[0].Up != Upper("CIAO") {
+		t.Fatalf("row0.Up scanner not applied: %+v", out[0])
+	}
+	if out[1] == nil || out[1].Up != Upper("HEY") {
+		t.Fatalf("row1.Up scanner not applied: %+v", out[1])
+	}
+}
+
+// TestMapper_ScanAll_FieldByIndexAlloc_IntermediatePtr_ckValue
+// Verifica che con un puntatore intermedio nel path (Row.Inner *Inner)
+// e un leaf NON-Scanner (int), scanAll usi fieldByIndexAlloc per raggiungere
+// il campo e allochi i nodi pointer intermedi.
+func TestMapper_ScanAll_FieldByIndexAlloc_IntermediatePtr_ckValue(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Inner struct {
+		A int `db:"a"`
+	}
+	type Row struct {
+		Inner *Inner
+	}
+
+	rows := sqlmock.NewRows([]string{"a"}).
+		AddRow(5).
+		AddRow(7)
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	var out []Row
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out)=%d, want 2", len(out))
+	}
+	// Il puntatore intermedio deve essere allocato e valorizzato.
+	if out[0].Inner == nil || out[0].Inner.A != 5 {
+		t.Fatalf("row0.Inner alloc/scan failed: %+v", out[0])
+	}
+	if out[1].Inner == nil || out[1].Inner.A != 7 {
+		t.Fatalf("row1.Inner alloc/scan failed: %+v", out[1])
+	}
+}
+
+// TestMapper_ScanAll_FieldByIndexAlloc_IntermediatePtr_ckScanner_ValueLeaf
+// Verifica che con un puntatore intermedio e un leaf che implementa Scanner come value
+// (Upper: *Upper implementa sql.Scanner), scanAll usi fieldByIndexAlloc per ottenere &T.
+func TestMapper_ScanAll_FieldByIndexAlloc_IntermediatePtr_ckScanner_ValueLeaf(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Inner struct {
+		U Upper `db:"u"` // value; *Upper implements sql.Scanner
+	}
+	type Row struct {
+		Inner *Inner
+	}
+
+	rows := sqlmock.NewRows([]string{"u"}).
+		AddRow("ciao").
+		AddRow([]byte("hey"))
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	var out []Row
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out)=%d, want 2", len(out))
+	}
+	if out[0].Inner == nil || out[0].Inner.U != Upper("CIAO") {
+		t.Fatalf("row0.Inner.U scanner not applied: %+v", out[0])
+	}
+	if out[1].Inner == nil || out[1].Inner.U != Upper("HEY") {
+		t.Fatalf("row1.Inner.U scanner not applied: %+v", out[1])
+	}
+}
+
+// TestMapper_ScanAll_FieldByIndexAlloc_IntermediatePtr_ckScanner_PtrLeaf
+// Verifica che con un puntatore intermedio e un leaf *Scanner (U *Upper, dove *Upper implementa Scanner)
+// venga usato il percorso con sink + post-processing, e fieldByIndexAlloc nel post-set.
+func TestMapper_ScanAll_FieldByIndexAlloc_IntermediatePtr_ckScanner_PtrLeaf(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Inner struct {
+		U *Upper `db:"u"` // *Upper implements sql.Scanner (ckScanner branch con ptrScannerIdx)
+	}
+	type Row struct {
+		Inner *Inner
+	}
+
+	rows := sqlmock.NewRows([]string{"u"}).
+		AddRow("hello"). // non-NULL -> alloc e Scan su *Upper
+		AddRow(nil)      // NULL -> lascia nil
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	var out []Row
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out)=%d, want 2", len(out))
+	}
+	// r0: Inner allocato, U allocato e uppercased
+	if out[0].Inner == nil || out[0].Inner.U == nil || *out[0].Inner.U != Upper("HELLO") {
+		t.Fatalf("row0.Inner.U got=%v, want *Upper(\"HELLO\")", out[0].Inner.U)
+	}
+	// r1: Inner viene comunque allocato (intermedio), ma leaf U deve restare nil per NULL
+	if out[1].Inner == nil {
+		t.Fatalf("row1.Inner should be allocated (intermediate ptr), got nil")
+	}
+	if out[1].Inner.U != nil {
+		t.Fatalf("row1.Inner.U should be nil on NULL, got=%v", *out[1].Inner.U)
+	}
+}
+
+// TestMapper_ScanAll_PtrSlice_FieldByIndexAlloc_IntermediatePtr_ckValue
+// Copre: ramo isPtr=true, hasPtrPath=true, case ckValue → fv = fieldByIndexAlloc(...)
+func TestMapper_ScanAll_PtrSlice_FieldByIndexAlloc_IntermediatePtr_ckValue(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Inner struct {
+		A int `db:"a"`
+	}
+	type Row struct {
+		Inner *Inner
+	}
+
+	rows := sqlmock.NewRows([]string{"a"}).
+		AddRow(11).
+		AddRow(22)
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	var out []*Row
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out)=%d, want 2", len(out))
+	}
+	if out[0] == nil || out[0].Inner == nil || out[0].Inner.A != 11 {
+		t.Fatalf("row0.Inner alloc/scan failed: %+v", out[0])
+	}
+	if out[1] == nil || out[1].Inner == nil || out[1].Inner.A != 22 {
+		t.Fatalf("row1.Inner alloc/scan failed: %+v", out[1])
+	}
+}
+
+// TestMapper_ScanAll_PtrSlice_FieldByIndexAlloc_IntermediatePtr_ckScanner_ValueLeaf
+// Copre: ramo isPtr=true, hasPtrPath=true, case ckScanner (leaf value con *Upper Scanner) → fv = fieldByIndexAlloc(...)
+func TestMapper_ScanAll_PtrSlice_FieldByIndexAlloc_IntermediatePtr_ckScanner_ValueLeaf(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Inner struct {
+		U Upper `db:"u"` // value; *Upper implementa sql.Scanner
+	}
+	type Row struct {
+		Inner *Inner
+	}
+
+	rows := sqlmock.NewRows([]string{"u"}).
+		AddRow("ciao").
+		AddRow([]byte("hey"))
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	var out []*Row
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out)=%d, want 2", len(out))
+	}
+	if out[0] == nil || out[0].Inner == nil || out[0].Inner.U != Upper("CIAO") {
+		t.Fatalf("row0.Inner.U scanner not applied: %+v", out[0])
+	}
+	if out[1] == nil || out[1].Inner == nil || out[1].Inner.U != Upper("HEY") {
+		t.Fatalf("row1.Inner.U scanner not applied: %+v", out[1])
+	}
+}
+
+// TestMapper_ScanAll_PtrSlice_FieldByIndexAlloc_IntermediatePtr_ckScanner_PtrLeaf
+// Copre: ramo isPtr=true, hasPtrPath=true, case ckScanner (leaf pointer *Upper) →
+//   - in preparazione target: fv = fieldByIndexAlloc(...) (anche se si usa sink+post)
+//   - in post-processing: fv = fieldByIndexAlloc(...) per assegnare *Upper/non-nil o nil
+func TestMapper_ScanAll_PtrSlice_FieldByIndexAlloc_IntermediatePtr_ckScanner_PtrLeaf(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	type Inner struct {
+		U *Upper `db:"u"` // *Upper implementa sql.Scanner
+	}
+	type Row struct {
+		Inner *Inner
+	}
+
+	rows := sqlmock.NewRows([]string{"u"}).
+		AddRow("hello"). // non-NULL → alloc + Scan
+		AddRow(nil)      // NULL → resta nil
+	mock.ExpectQuery(".*").WillReturnRows(rows)
+
+	var out []*Row
+	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
+	assertNoError(t, err)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out)=%d, want 2", len(out))
+	}
+	if out[0] == nil || out[0].Inner == nil || out[0].Inner.U == nil || *out[0].Inner.U != Upper("HELLO") {
+		t.Fatalf("row0.Inner.U got=%v, want *Upper(\"HELLO\")", out[0])
+	}
+	if out[1] == nil || out[1].Inner == nil {
+		t.Fatalf("row1.Inner should be allocated (intermediate ptr)")
+	}
+	if out[1].Inner.U != nil {
+		t.Fatalf("row1.Inner.U should be nil on NULL, got=%v", *out[1].Inner.U)
+	}
+}
+
 // TestMapper_Scan_PointerToScannerType_ScanOne covers ScanOne behavior with a
 // pointer-to-Scanner field: it is allocated and scanned for non-NULL, and
 // remains nil for NULL values.

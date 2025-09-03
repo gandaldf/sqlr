@@ -39,7 +39,7 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 	args := make([]any, 0, est)
 
 	var buf strings.Builder
-	// Small oversizing to reduce reallocations; some dialects emit longer tokens.
+	// Slight oversizing to reduce reallocations; some dialects emit longer tokens.
 	extraPer := 1
 	switch dialect {
 	case Postgres, SQLServer:
@@ -69,6 +69,10 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 		}
 		return nil
 	}
+
+	// Conservative estimate for how many bytes of SQL each placeholder expansion costs.
+	// Includes token ("$123" / "@p123" / "?") + separators like ", " and some parens.
+	const approxPerPlaceholder = 6
 
 	for i := 0; i < len(q); {
 		c := q[i]
@@ -166,6 +170,27 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 						if err := ensureAdd(n, need); err != nil {
 							return "", nil, err
 						}
+
+						// --- PRE-GROW: args capacity and SQL buffer for :rows{...} ---
+						// Grow args capacity once to avoid multiple reallocations when appending.
+						if extra := need - (cap(args) - len(args)); extra > 0 {
+							na := make([]any, len(args), len(args)+extra)
+							copy(na, args)
+							args = na
+						}
+						// Rough SQL growth: placeholders + per-row punctuation.
+						// Per row we add "(" and ")" (+2), and ", " between columns (2*(len(cols)-1)).
+						perRowSep := 2
+						if len(cols) > 1 {
+							perRowSep += 2 * (len(cols) - 1)
+						}
+						// Also account for ", " between rows: 2*(len(rows)-1)
+						extraSQL := need*approxPerPlaceholder + len(rows)*perRowSep
+						if len(rows) > 1 {
+							extraSQL += 2 * (len(rows) - 1)
+						}
+						buf.Grow(extraSQL)
+						// --- END PRE-GROW ---
 
 						// FAST-PATH: setup
 						var (
@@ -346,6 +371,19 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 						if err := ensureAdd(n, ln); err != nil {
 							return "", nil, err
 						}
+
+						// --- PRE-GROW: args capacity and SQL buffer for slice expansion ---
+						if extra := ln - (cap(args) - len(args)); extra > 0 {
+							na := make([]any, len(args), len(args)+extra)
+							copy(na, args)
+							args = na
+						}
+						// ", " between items: 2*(ln-1)
+						if ln > 0 {
+							buf.Grow(ln*approxPerPlaceholder + 2*(ln-1))
+						}
+						// --- END PRE-GROW ---
+
 						for t := 0; t < ln; t++ {
 							if t > 0 {
 								buf.WriteString(", ")

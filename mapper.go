@@ -64,14 +64,36 @@ func scanOneWithPlan(rows *sql.Rows, cols []string, dstStruct reflect.Value) err
 	}
 	st := plan.newState()
 
-	// prepare targets for this single row
+	// Indices of columns whose destination field is a *T where *T implements sql.Scanner.
+	// We capture the raw DB value into a sink and post-process after Scan to keep
+	// the pointer nil on NULL.
+	var ptrScannerIdx []int
+
+	// Prepare targets for this single row
 	for i := range cols {
 		switch plan.kinds[i] {
 		case ckSink:
 			st.targets[i] = st.sinks[i]
-		case ckScanner, ckValue:
+
+		case ckScanner:
+			fv := fieldByIndexAlloc(dstStruct, plan.fPath[i])
+			ft := fv.Type()
+
+			if ft.Kind() == reflect.Pointer && ft.Implements(scannerIface) {
+				// Field is *T and *T implements sql.Scanner → capture raw into sink,
+				// then allocate and Scan only if non-NULL.
+				st.targets[i] = st.sinks[i]
+				ptrScannerIdx = append(ptrScannerIdx, i)
+			} else {
+				// Field is T and *T implements sql.Scanner, or T itself implements Scanner:
+				// pass &T directly to rows.Scan.
+				st.targets[i] = fv.Addr().Interface()
+			}
+
+		case ckValue:
 			fv := fieldByIndexAlloc(dstStruct, plan.fPath[i])
 			st.targets[i] = fv.Addr().Interface()
+
 		case ckPtr:
 			h := st.holders[i]
 			h.Elem().SetZero()
@@ -82,9 +104,34 @@ func scanOneWithPlan(rows *sql.Rows, cols []string, dstStruct reflect.Value) err
 	if err := rows.Scan(st.targets...); err != nil {
 		return err
 	}
+
+	// Apply **ckPtr** post-assignments
 	for _, i := range plan.ptrIdx {
 		setFieldByIndex(dstStruct, plan.fPath[i], st.holders[i].Elem())
 	}
+
+	// Post-process pointer-to-Scanner fields: keep nil on NULL; allocate and Scan otherwise.
+	for _, i := range ptrScannerIdx {
+		raw := *(st.sinks[i].(*any))
+
+		fv := fieldByIndexAlloc(dstStruct, plan.fPath[i])
+		ft := fv.Type() // *T
+
+		if raw == nil {
+			setFieldByIndex(dstStruct, plan.fPath[i], reflect.Zero(ft))
+			continue
+		}
+		p := reflect.New(ft.Elem()) // *T
+		sc, ok := p.Interface().(sql.Scanner)
+		if !ok {
+			return fmt.Errorf("sqlr: internal: %v does not implement sql.Scanner", ft)
+		}
+		if err := sc.Scan(raw); err != nil {
+			return err
+		}
+		setFieldByIndex(dstStruct, plan.fPath[i], p)
+	}
+
 	return nil
 }
 
@@ -100,6 +147,7 @@ func scanAll(rows *sql.Rows, dest any) error {
 		return fmt.Errorf("sqlr: ScanAll requires a pointer to slice")
 	}
 
+	// Keep existing capacity (benchmarks often preallocate); just reset length.
 	if rv.Len() != 0 {
 		rv.Set(rv.Slice(0, 0))
 	}
@@ -112,7 +160,7 @@ func scanAll(rows *sql.Rows, dest any) error {
 
 	switch elemT.Kind() {
 	case reflect.Struct, reflect.Pointer:
-		// Support []Struct and []*Struct
+		// Support []T and []*T where T is struct
 		var structT reflect.Type
 		isPtr := elemT.Kind() == reflect.Pointer
 		if isPtr {
@@ -130,19 +178,71 @@ func scanAll(rows *sql.Rows, dest any) error {
 		}
 		st := plan.newState()
 
+		// Precompute which paths have intermediate pointers.
+		hasPtrPath := make([]bool, len(cols))
+		for i := range cols {
+			hasPtrPath[i] = hasPtrOnPath(structT, plan.fPath[i])
+		}
+
+		// Reusable buffer for pointer-to-Scanner indices to avoid per-iter allocs.
+		var ptrScannerIdx []int
+
 		for rows.Next() {
+			// Grow length by 1 using reslice (avoid reflect.Append).
+			l := rv.Len()
+			if l < rv.Cap() {
+				rv.Set(rv.Slice(0, l+1))
+			} else {
+				newCap := rv.Cap() * 2
+				if newCap == 0 {
+					newCap = 1
+				}
+				ns := reflect.MakeSlice(rv.Type(), l+1, newCap)
+				reflect.Copy(ns, rv)
+				rv.Set(ns)
+			}
+			idx := l
+
 			if isPtr {
-				// []*Struct: create *Struct, populate Elem and append the pointer
+				// []*T: create *T, scan into its Elem, then assign ptr at idx.
 				ptr := reflect.New(structT)
 				dst := ptr.Elem()
 
+				// Reset reusable list
+				ptrScannerIdx = ptrScannerIdx[:0]
+
+				// Prepare targets
 				for i := range cols {
 					switch plan.kinds[i] {
 					case ckSink:
 						st.targets[i] = st.sinks[i]
-					case ckScanner, ckValue:
-						fv := fieldByIndexAlloc(dst, plan.fPath[i])
+
+					case ckScanner:
+						var fv reflect.Value
+						if hasPtrPath[i] {
+							fv = fieldByIndexAlloc(dst, plan.fPath[i])
+						} else {
+							fv = dst.FieldByIndex(plan.fPath[i])
+						}
+						ft := fv.Type()
+						if ft.Kind() == reflect.Pointer && ft.Implements(scannerIface) {
+							// *T implements sql.Scanner -> capture raw in sink, post-process
+							st.targets[i] = st.sinks[i]
+							ptrScannerIdx = append(ptrScannerIdx, i)
+						} else {
+							// T with *T as Scanner, or T itself implements Scanner -> pass &T
+							st.targets[i] = fv.Addr().Interface()
+						}
+
+					case ckValue:
+						var fv reflect.Value
+						if hasPtrPath[i] {
+							fv = fieldByIndexAlloc(dst, plan.fPath[i])
+						} else {
+							fv = dst.FieldByIndex(plan.fPath[i])
+						}
 						st.targets[i] = fv.Addr().Interface()
+
 					case ckPtr:
 						h := st.holders[i]
 						h.Elem().SetZero()
@@ -156,20 +256,73 @@ func scanAll(rows *sql.Rows, dest any) error {
 				for _, i := range plan.ptrIdx {
 					setFieldByIndex(dst, plan.fPath[i], st.holders[i].Elem())
 				}
+				// Post-process pointer-to-Scanner fields
+				for _, i := range ptrScannerIdx {
+					raw := *(st.sinks[i].(*any))
+					var fv reflect.Value
+					if hasPtrPath[i] {
+						fv = fieldByIndexAlloc(dst, plan.fPath[i])
+					} else {
+						fv = dst.FieldByIndex(plan.fPath[i])
+					}
+					ft := fv.Type() // *T
 
-				rv.Set(reflect.Append(rv, ptr))
+					if raw == nil {
+						setFieldByIndex(dst, plan.fPath[i], reflect.Zero(ft))
+						continue
+					}
+					p := reflect.New(ft.Elem()) // *T
+					sc, ok := p.Interface().(sql.Scanner)
+					if !ok {
+						return fmt.Errorf("sqlr: internal: %v does not implement sql.Scanner", ft)
+					}
+					if err := sc.Scan(raw); err != nil {
+						return err
+					}
+					setFieldByIndex(dst, plan.fPath[i], p)
+				}
+
+				// Assign pointer at the computed index (no Append).
+				rv.Index(idx).Set(ptr)
+
 			} else {
-				// []Struct: add a zero element and populate the last one in place
-				rv.Set(reflect.Append(rv, reflect.Zero(structT)))
-				dst := rv.Index(rv.Len() - 1)
+				// []T: scan directly into the new element.
+				dst := rv.Index(idx)
+
+				// Reset reusable list
+				ptrScannerIdx = ptrScannerIdx[:0]
 
 				for i := range cols {
 					switch plan.kinds[i] {
 					case ckSink:
 						st.targets[i] = st.sinks[i]
-					case ckScanner, ckValue:
-						fv := fieldByIndexAlloc(dst, plan.fPath[i])
+
+					case ckScanner:
+						var fv reflect.Value
+						if hasPtrPath[i] {
+							fv = fieldByIndexAlloc(dst, plan.fPath[i])
+						} else {
+							fv = dst.FieldByIndex(plan.fPath[i])
+						}
+						ft := fv.Type()
+						if ft.Kind() == reflect.Pointer && ft.Implements(scannerIface) {
+							// *T implements sql.Scanner -> capture raw, post-process
+							st.targets[i] = st.sinks[i]
+							ptrScannerIdx = append(ptrScannerIdx, i)
+						} else {
+							// T with *T as Scanner, or T itself implements Scanner -> pass &T
+							st.targets[i] = fv.Addr().Interface()
+						}
+
+					case ckValue:
+						var fv reflect.Value
+						if hasPtrPath[i] {
+							fv = fieldByIndexAlloc(dst, plan.fPath[i])
+						} else {
+							fv = dst.FieldByIndex(plan.fPath[i])
+						}
 						st.targets[i] = fv.Addr().Interface()
+
 					case ckPtr:
 						h := st.holders[i]
 						h.Elem().SetZero()
@@ -182,6 +335,31 @@ func scanAll(rows *sql.Rows, dest any) error {
 				}
 				for _, i := range plan.ptrIdx {
 					setFieldByIndex(dst, plan.fPath[i], st.holders[i].Elem())
+				}
+				// Post-process pointer-to-Scanner fields
+				for _, i := range ptrScannerIdx {
+					raw := *(st.sinks[i].(*any))
+					var fv reflect.Value
+					if hasPtrPath[i] {
+						fv = fieldByIndexAlloc(dst, plan.fPath[i])
+					} else {
+						fv = dst.FieldByIndex(plan.fPath[i])
+					}
+					ft := fv.Type() // *T
+
+					if raw == nil {
+						setFieldByIndex(dst, plan.fPath[i], reflect.Zero(ft))
+						continue
+					}
+					p := reflect.New(ft.Elem()) // *T
+					sc, ok := p.Interface().(sql.Scanner)
+					if !ok {
+						return fmt.Errorf("sqlr: internal: %v does not implement sql.Scanner", ft)
+					}
+					if err := sc.Scan(raw); err != nil {
+						return err
+					}
+					setFieldByIndex(dst, plan.fPath[i], p)
 				}
 			}
 		}
@@ -193,11 +371,23 @@ func scanAll(rows *sql.Rows, dest any) error {
 			return fmt.Errorf("sqlr: ScanAll on slice of non-struct requires 1 column, got %d", len(cols))
 		}
 		for rows.Next() {
-			item := reflect.New(elemT).Elem()
+			// Grow by 1 using reslice (avoid reflect.Append).
+			l := rv.Len()
+			if l < rv.Cap() {
+				rv.Set(rv.Slice(0, l+1))
+			} else {
+				newCap := rv.Cap() * 2
+				if newCap == 0 {
+					newCap = 1
+				}
+				ns := reflect.MakeSlice(rv.Type(), l+1, newCap)
+				reflect.Copy(ns, rv)
+				rv.Set(ns)
+			}
+			item := rv.Index(l)
 			if err := rows.Scan(item.Addr().Interface()); err != nil {
 				return err
 			}
-			rv.Set(reflect.Append(rv, item))
 		}
 		return rows.Err()
 	}
@@ -245,6 +435,39 @@ func setFieldByIndex(root reflect.Value, path []int, value reflect.Value) {
 			v = f
 		}
 	}
+}
+
+// hasPtrOnPath reports whether any intermediate field along 'path'
+// (excluding the leaf itself) is a pointer type. We use the static struct type
+// to decide a faster access strategy at runtime (FieldByIndex vs alloc-walking).
+func hasPtrOnPath(rootT reflect.Type, path []int) bool {
+	// Normalize to concrete struct type
+	for rootT.Kind() == reflect.Pointer {
+		rootT = rootT.Elem()
+	}
+	t := rootT
+
+	for i, idx := range path {
+		// Defensive: t must be a struct here
+		if t.Kind() != reflect.Struct {
+			return true // unexpected shape, force safe path
+		}
+		f := t.Field(idx)
+		if i == len(path)-1 {
+			// Leaf: we only care about intermediate nodes
+			return false
+		}
+		ft := f.Type
+		if ft.Kind() == reflect.Pointer {
+			return true
+		}
+		// Descend into next struct; if it's not a struct, force safe path
+		if ft.Kind() != reflect.Struct {
+			return true
+		}
+		t = ft
+	}
+	return false
 }
 
 // buildScanPlan builds an immutable scanPlan describing how each result column
