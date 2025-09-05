@@ -26,12 +26,16 @@ var structIndexCache = newFieldCache(cacheSize)
 // SQL, substitutes :name placeholders (including rows blocks :name{a,b}),
 // tracks placeholder counting, and emits dialect-specific placeholders.
 func parse(dialect Dialect, q string, inputs []any, config Config) (string, []any, error) {
-	lookup, rowsLookup, err := makeMultiResolver(inputs)
+	// Build fallback resolvers and detect fast bag (map[string]any) materialized in Bind.
+	fastBag := parseFastBag(inputs)
+	lookupFB, rowsLookupFB, err := makeMultiResolver(inputs)
 	if err != nil {
 		return "", nil, err
 	}
+	lookup := parseMakeValueLookup(fastBag, lookupFB)
+	rowsLookup := parseMakeRowsLookup(fastBag, rowsLookupFB)
 
-	// Rough estimate for number of placeholders (not exact, but helps sizing).
+	// Rough placeholder estimate to pre-size buffers.
 	est := strings.Count(q, ":") - strings.Count(q, "::")
 	if est < 0 {
 		est = 0
@@ -39,7 +43,6 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 	args := make([]any, 0, est)
 
 	var buf strings.Builder
-	// Slight oversizing to reduce reallocations; some dialects emit longer tokens.
 	extraPer := 1
 	switch dialect {
 	case Postgres, SQLServer:
@@ -47,10 +50,7 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 	}
 	buf.Grow(len(q) + 16 + est*extraPer)
 
-	n := 0
-	var dqTag string // active dollar-quoted tag (Postgres-like)
-
-	// State machine for safe parsing through strings, comments, identifiers, etc.
+	// Parser state
 	const (
 		sText = iota
 		sSQ   // '...'
@@ -62,353 +62,36 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 		sDQD  // $tag$ ... $tag$ (dollar-quoted)
 	)
 	state := sText
-
-	ensureAdd := func(cur, add int) error {
-		if config.MaxParams > 0 && cur+add > config.MaxParams {
-			return fmt.Errorf("%w: requested=%d, limit=%d", ErrTooManyParams, cur+add, config.MaxParams)
-		}
-		return nil
-	}
-
-	// Conservative estimate for how many bytes of SQL each placeholder expansion costs.
-	// Includes token ("$123" / "@p123" / "?") + separators like ", " and some parens.
-	const approxPerPlaceholder = 6
+	var dqTag string // active $tag$ for PG-like dollar-quoting
+	n := 0
 
 	for i := 0; i < len(q); {
 		c := q[i]
 
 		switch state {
 		case sText:
-			// Enter/exit helper states while preserving the raw text
-			if c == '-' && i+1 < len(q) && q[i+1] == '-' {
-				state = sLC
-				buf.WriteString("--")
-				i += 2
+			// 1) Try entering a quoted/comment state (writes the opener to buf if any)
+			if newState, newI, newTag, ok := parseTryEnterSpecial(q, i, dialect, &buf); ok {
+				state, i, dqTag = newState, newI, newTag
 				continue
 			}
-			if c == '#' && dialect == MySQL {
-				state = sLC
-				buf.WriteByte('#')
-				i++
-				continue
-			}
-			if c == '/' && i+1 < len(q) && q[i+1] == '*' {
-				state = sBC
-				buf.WriteString("/*")
-				i += 2
-				continue
-			}
-			if c == '\'' {
-				state = sSQ
-				buf.WriteByte(c)
-				i++
-				continue
-			}
-			if c == '"' {
-				state = sDQ
-				buf.WriteByte(c)
-				i++
-				continue
-			}
-			if c == '`' && (dialect == MySQL || dialect == SQLite) {
-				state = sBT
-				buf.WriteByte(c)
-				i++
-				continue
-			}
-			if c == '[' && dialect == SQLServer {
-				state = sBR
-				buf.WriteByte(c)
-				i++
-				continue
-			}
-			if c == '$' {
-				if tag, ok := readDollarTag(q[i:]); ok {
-					state = sDQD
-					dqTag = tag
-					buf.WriteString(tag)
-					i += len(tag)
+			// 2) Try a :name or :name{...} placeholder
+			if parseIsParamStart(q, i) {
+				newI, handled, err := parseHandlePlaceholder(q, i, dialect, config, lookup, rowsLookup, &buf, &args, &n)
+				if err != nil {
+					return "", nil, err
+				}
+				if handled {
+					i = newI
 					continue
 				}
 			}
-
-			// :name or :name{...}
-			if c == ':' && (i+1) < len(q) && q[i+1] != ':' && !(i > 0 && q[i-1] == ':') {
-				j := i + 1
-				if isAlphaUnderscore(q[j]) {
-					k := j + 1
-					for k < len(q) && isAlphaNumUnderscore(q[k]) {
-						k++
-					}
-					name := q[j:k]
-
-					// Check name length
-					if config.MaxNameLen > 0 && len(name) > config.MaxNameLen {
-						return "", nil, fmt.Errorf("%w: %q (%d > %d)", ErrParamNameTooLong, name, len(name), config.MaxNameLen)
-					}
-
-					// :name{col,...}  e.g. :rows{id,name}
-					if k < len(q) && q[k] == '{' {
-						k2, cols, ok := readCols(q, k)
-						if !ok {
-							return "", nil, fmt.Errorf("%w: :%s{...}", ErrRowsMalformed, name)
-						}
-						if len(cols) == 0 {
-							return "", nil, fmt.Errorf("%w: :%s{...} without columns", ErrRowsMalformed, name)
-						}
-
-						rows, ok := rowsLookup(name)
-						if !ok {
-							return "", nil, fmt.Errorf("%w: :%s{...}", ErrParamMissing, name)
-						}
-						if len(rows) == 0 {
-							return "", nil, fmt.Errorf("%w: :%s{...}", ErrRowsEmpty, name)
-						}
-
-						// Pre-check number of placeholders to emit for this block
-						need := len(rows) * len(cols)
-						if err := ensureAdd(n, need); err != nil {
-							return "", nil, err
-						}
-
-						// --- PRE-GROW: args capacity and SQL buffer for :rows{...} ---
-						// Grow args capacity once to avoid multiple reallocations when appending.
-						if extra := need - (cap(args) - len(args)); extra > 0 {
-							na := make([]any, len(args), len(args)+extra)
-							copy(na, args)
-							args = na
-						}
-						// Rough SQL growth: placeholders + per-row punctuation.
-						// Per row we add "(" and ")" (+2), and ", " between columns (2*(len(cols)-1)).
-						perRowSep := 2
-						if len(cols) > 1 {
-							perRowSep += 2 * (len(cols) - 1)
-						}
-						// Also account for ", " between rows: 2*(len(rows)-1)
-						extraSQL := need*approxPerPlaceholder + len(rows)*perRowSep
-						if len(rows) > 1 {
-							extraSQL += 2 * (len(rows) - 1)
-						}
-						buf.Grow(extraSQL)
-						// --- END PRE-GROW ---
-
-						// FAST-PATH: setup
-						var (
-							colKeys       []reflect.Value          // for maps: pre-converted keys
-							mapKeyT       reflect.Type             // map key type of first seen map element
-							colPathByType map[reflect.Type][][]int // for structs: type → paths per column
-						)
-
-						rv0 := deIndirect(reflect.ValueOf(rows[0]))
-						if rv0.IsValid() && rv0.Kind() == reflect.Map {
-							mapKeyT = rv0.Type().Key()
-							// If key type is string-like, pre-convert all column names to that key type
-							if mapKeyT.Kind() == reflect.String || reflect.TypeOf("").ConvertibleTo(mapKeyT) {
-								colKeys = make([]reflect.Value, len(cols))
-								for i, col := range cols {
-									kv := reflect.ValueOf(col)
-									if kv.Type() != mapKeyT && kv.Type().ConvertibleTo(mapKeyT) {
-										kv = kv.Convert(mapKeyT)
-									}
-									colKeys[i] = kv
-								}
-							}
-						}
-						if rv0.IsValid() && rv0.Kind() == reflect.Struct {
-							colPathByType = make(map[reflect.Type][][]int, 4)
-							baseT := rv0.Type()
-							baseMap := fieldIndexMap(baseT)
-							paths := make([][]int, len(cols))
-							for i, col := range cols {
-								fi, ok := baseMap[col]
-								if !ok {
-									return "", nil, fmt.Errorf("%w: %q in :%s{...} (record 0)", ErrColumnNotFound, col, name)
-								}
-								// Ambiguous in precompute → explicit error
-								if fi.ambiguous {
-									return "", nil, fmt.Errorf("%w: %q in :%s{...} (record 0)", ErrFieldAmbiguous, col, name)
-								}
-								paths[i] = fi.index
-							}
-							colPathByType[baseT] = paths
-						}
-
-						// Emit VALUES (...) , (...)
-						for r := 0; r < len(rows); r++ {
-							if r > 0 {
-								buf.WriteString(", ")
-							}
-							buf.WriteByte('(')
-
-							rv := deIndirect(reflect.ValueOf(rows[r]))
-							useMapFast := (colKeys != nil && rv.IsValid() && rv.Kind() == reflect.Map && rv.Type().Key() == mapKeyT)
-
-							for cidx := range cols {
-								if cidx > 0 {
-									buf.WriteString(", ")
-								}
-
-								var v any
-								var ok bool
-
-								if rv.IsValid() && rv.Kind() == reflect.Struct {
-									paths, has := colPathByType[rv.Type()]
-									if !has {
-										if colPathByType == nil {
-											colPathByType = make(map[reflect.Type][][]int, 4)
-										}
-										fm := fieldIndexMap(rv.Type())
-										paths = make([][]int, len(cols))
-										for iCol, col := range cols {
-											fi, hit := fm[col]
-											if !hit {
-												return "", nil, fmt.Errorf("%w: %q in :%s{...} (record %d)", ErrColumnNotFound, col, name, r)
-											}
-											// Ambiguous per-row (heterogeneous types) -> error
-											if fi.ambiguous {
-												return "", nil, fmt.Errorf("%w: %q in :%s{...} (record %d)", ErrFieldAmbiguous, col, name, r)
-											}
-											paths[iCol] = fi.index
-										}
-										colPathByType[rv.Type()] = paths
-									}
-									v, ok = getValueByPathAny(rv, paths[cidx])
-								} else if useMapFast {
-									mv := rv.MapIndex(colKeys[cidx])
-									if mv.IsValid() {
-										v, ok = mv.Interface(), true
-									}
-								} else {
-									// Generic fallback (maps with non-string-like keys, mixed types, etc.)
-									v, ok = getColValue(rows[r], cols[cidx])
-								}
-
-								if !ok {
-									return "", nil, fmt.Errorf("%w: %q in :%s{...} (record %d)", ErrColumnNotFound, cols[cidx], name, r)
-								}
-
-								n++
-								writePlaceholder(&buf, dialect, n)
-								args = append(args, v)
-							}
-
-							buf.WriteByte(')')
-						}
-
-						i = k2
-						continue
-					}
-
-					// Simple :name (single value or slice expansion)
-					v, ok := lookup(name)
-					if !ok {
-						return "", nil, fmt.Errorf("%w: %s", ErrParamMissing, name)
-					}
-
-					// Bubble up ambiguous
-					if a, isAmbiguous := v.(ambiguousSentinel); isAmbiguous {
-						return "", nil, fmt.Errorf("%w: %q", ErrFieldAmbiguous, a.name)
-					}
-
-					// Scalar / driver.Valuer / []byte → single placeholder
-					if _, ok := v.(scalar); ok {
-						if err := ensureAdd(n, 1); err != nil {
-							return "", nil, err
-						}
-						n++
-						writePlaceholder(&buf, dialect, n)
-						args = append(args, v.(scalar).v)
-						i = k
-						continue
-					}
-					if _, ok := v.(driver.Valuer); ok {
-						if err := ensureAdd(n, 1); err != nil {
-							return "", nil, err
-						}
-						n++
-						writePlaceholder(&buf, dialect, n)
-						args = append(args, v)
-						i = k
-						continue
-					}
-
-					// FAST-PATH: []byte → one placeholder, no expansion
-					if bs, ok := v.([]byte); ok {
-						if err := ensureAdd(n, 1); err != nil {
-							return "", nil, err
-						}
-						n++
-						writePlaceholder(&buf, dialect, n)
-						args = append(args, bs)
-						i = k
-						continue
-					}
-
-					rv := reflect.ValueOf(v)
-
-					if rv.IsValid() && rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
-						// Treat any "byte slice-like" (even aliases) as a []single byte placeholder
-						if err := ensureAdd(n, 1); err != nil {
-							return "", nil, err
-						}
-						n++
-						writePlaceholder(&buf, dialect, n)
-						// Converts to []byte if needed
-						if rv.Type() != reflect.TypeOf([]byte(nil)) && rv.Type().ConvertibleTo(reflect.TypeOf([]byte(nil))) {
-							args = append(args, rv.Convert(reflect.TypeOf([]byte(nil))).Interface())
-						} else {
-							args = append(args, v)
-						}
-						i = k
-						continue
-					}
-
-					if (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && rv.Type().Elem().Kind() != reflect.Uint8 {
-						ln := rv.Len()
-						if ln == 0 {
-							return "", nil, fmt.Errorf("%w: %s", ErrSliceEmpty, name)
-						}
-						if err := ensureAdd(n, ln); err != nil {
-							return "", nil, err
-						}
-
-						// --- PRE-GROW: args capacity and SQL buffer for slice expansion ---
-						if extra := ln - (cap(args) - len(args)); extra > 0 {
-							na := make([]any, len(args), len(args)+extra)
-							copy(na, args)
-							args = na
-						}
-						// ", " between items: 2*(ln-1)
-						if ln > 0 {
-							buf.Grow(ln*approxPerPlaceholder + 2*(ln-1))
-						}
-						// --- END PRE-GROW ---
-
-						for t := 0; t < ln; t++ {
-							if t > 0 {
-								buf.WriteString(", ")
-							}
-							n++
-							writePlaceholder(&buf, dialect, n)
-							args = append(args, rv.Index(t).Interface())
-						}
-					} else {
-						if err := ensureAdd(n, 1); err != nil {
-							return "", nil, err
-						}
-						n++
-						writePlaceholder(&buf, dialect, n)
-						args = append(args, v)
-					}
-					i = k
-					continue
-				}
-			}
-
+			// 3) Plain text byte
 			buf.WriteByte(c)
 			i++
 
 		case sSQ:
+			// single-quoted literal with backslash and doubled-quote handling
 			if c == '\\' {
 				buf.WriteByte(c)
 				i++
@@ -430,6 +113,7 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 			}
 
 		case sDQ:
+			// double-quoted literal with backslash and doubled-quote handling
 			if c == '\\' {
 				buf.WriteByte(c)
 				i++
@@ -451,6 +135,7 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 			}
 
 		case sBT:
+			// backtick-quoted identifier (MySQL/SQLite)
 			buf.WriteByte(c)
 			i++
 			if c == '`' {
@@ -463,6 +148,7 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 			}
 
 		case sBR:
+			// bracket-quoted identifier (SQL Server)
 			buf.WriteByte(c)
 			i++
 			if c == ']' {
@@ -475,6 +161,7 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 			}
 
 		case sLC:
+			// line comment: -- ... or # ... (MySQL)
 			buf.WriteByte(c)
 			i++
 			if c == '\n' || c == '\r' {
@@ -482,6 +169,7 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 			}
 
 		case sBC:
+			// block comment: /* ... */
 			buf.WriteByte(c)
 			i++
 			if c == '*' && i < len(q) && q[i] == '/' {
@@ -491,6 +179,7 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 			}
 
 		case sDQD:
+			// dollar-quoted block: $tag$ ... $tag$
 			if dqTag == "" {
 				buf.WriteString(q[i:])
 				i = len(q)
@@ -511,6 +200,449 @@ func parse(dialect Dialect, q string, inputs []any, config Config) (string, []an
 	}
 
 	return buf.String(), args, nil
+}
+
+// parseFastBag returns the last input if it is a map[string]any, otherwise nil.
+func parseFastBag(inputs []any) map[string]any {
+	if len(inputs) == 0 {
+		return nil
+	}
+	if m, ok := inputs[len(inputs)-1].(map[string]any); ok && m != nil {
+		return m
+	}
+	return nil
+}
+
+// parseMakeValueLookup returns a composite lookup that checks the fast bag first,
+// then falls back to the generic resolver.
+func parseMakeValueLookup(fastBag map[string]any, fallback func(string) (any, bool)) func(string) (any, bool) {
+	return func(name string) (any, bool) {
+		if fastBag != nil {
+			if v, ok := fastBag[name]; ok {
+				return v, true
+			}
+		}
+		return fallback(name)
+	}
+}
+
+// parseMakeRowsLookup returns a composite rows-lookup that checks the fast bag first,
+// then falls back to the generic rows resolver.
+func parseMakeRowsLookup(
+	fastBag map[string]any,
+	fallback func(string) ([]rowVal, bool),
+) func(string) ([]rowVal, bool) {
+	return func(name string) ([]rowVal, bool) {
+		if fastBag != nil {
+			if v, ok := fastBag[name]; ok {
+				if rows, ok := rowsFromSliceValue(reflect.ValueOf(v)); ok {
+					return rows, true
+				}
+			}
+		}
+		return fallback(name)
+	}
+}
+
+// parseIsParamStart checks if q[i] starts a :name placeholder (not a :: cast).
+func parseIsParamStart(q string, i int) bool {
+	return q[i] == ':' && (i+1) < len(q) && q[i+1] != ':' && !(i > 0 && q[i-1] == ':')
+}
+
+// parseTryEnterSpecial inspects q[i] for comment/string/identifier openers,
+// writes them to buf and returns the new state and cursor when matched.
+func parseTryEnterSpecial(q string, i int, dialect Dialect, buf *strings.Builder) (newState int, newI int, dqTag string, ok bool) {
+	c := q[i]
+
+	// line comment: -- or # (MySQL)
+	if c == '-' && i+1 < len(q) && q[i+1] == '-' {
+		buf.WriteString("--")
+		return 5 /* sLC */, i + 2, "", true
+	}
+	if c == '#' && dialect == MySQL {
+		buf.WriteByte('#')
+		return 5 /* sLC */, i + 1, "", true
+	}
+
+	// block comment: /*
+	if c == '/' && i+1 < len(q) && q[i+1] == '*' {
+		buf.WriteString("/*")
+		return 6 /* sBC */, i + 2, "", true
+	}
+
+	// single-quoted literal
+	if c == '\'' {
+		buf.WriteByte(c)
+		return 1 /* sSQ */, i + 1, "", true
+	}
+
+	// double-quoted literal
+	if c == '"' {
+		buf.WriteByte(c)
+		return 2 /* sDQ */, i + 1, "", true
+	}
+
+	// backtick-quoted identifier (MySQL/SQLite)
+	if c == '`' && (dialect == MySQL || dialect == SQLite) {
+		buf.WriteByte(c)
+		return 3 /* sBT */, i + 1, "", true
+	}
+
+	// bracket-quoted identifier (SQL Server)
+	if c == '[' && dialect == SQLServer {
+		buf.WriteByte(c)
+		return 4 /* sBR */, i + 1, "", true
+	}
+
+	// dollar-quoted: $tag$
+	if c == '$' {
+		if tag, ok := readDollarTag(q[i:]); ok {
+			buf.WriteString(tag)
+			return 7 /* sDQD */, i + len(tag), tag, true
+		}
+	}
+
+	return 0, 0, "", false
+}
+
+// parseReadName tries to read an identifier after ':' at position j.
+// Returns the name and the index just after the name.
+func parseReadName(q string, j int) (name string, k int, ok bool) {
+	if !isAlphaUnderscore(q[j]) {
+		return "", j, false
+	}
+	k = j + 1
+	for k < len(q) && isAlphaNumUnderscore(q[k]) {
+		k++
+	}
+	return q[j:k], k, true
+}
+
+// parseHandlePlaceholder handles :name and :name{...} from q[i] (where q[i]==':').
+// On success, it advances the cursor and emits into buf/args adjusting n.
+func parseHandlePlaceholder(
+	q string,
+	i int,
+	dialect Dialect,
+	config Config,
+	lookup func(string) (any, bool),
+	rowsLookup func(string) ([]rowVal, bool),
+	buf *strings.Builder,
+	args *[]any,
+	n *int,
+) (newI int, handled bool, err error) {
+	j := i + 1
+	if j >= len(q) {
+		return i, false, nil
+	}
+
+	name, k, ok := parseReadName(q, j)
+	if !ok {
+		return i, false, nil
+	}
+
+	// Enforce MaxNameLen
+	if config.MaxNameLen > 0 && len(name) > config.MaxNameLen {
+		return 0, false, fmt.Errorf("%w: %q (%d > %d)", ErrParamNameTooLong, name, len(name), config.MaxNameLen)
+	}
+
+	// :name{...} rows-block
+	if k < len(q) && q[k] == '{' {
+		k2, cols, ok := readCols(q, k)
+		if !ok {
+			return 0, true, fmt.Errorf("%w: :%s{...}", ErrRowsMalformed, name)
+		}
+		if len(cols) == 0 {
+			return 0, true, fmt.Errorf("%w: :%s{...} without columns", ErrRowsMalformed, name)
+		}
+
+		rows, ok := rowsLookup(name)
+		if !ok {
+			return 0, true, fmt.Errorf("%w: :%s{...}", ErrParamMissing, name)
+		}
+		if len(rows) == 0 {
+			return 0, true, fmt.Errorf("%w: :%s{...}", ErrRowsEmpty, name)
+		}
+
+		if err := parseEnsureAdd(*n, len(rows)*len(cols), config); err != nil {
+			return 0, true, err
+		}
+		if err := parseEmitRowsBlock(name, cols, rows, dialect, buf, args, n); err != nil {
+			return 0, true, err
+		}
+		return k2, true, nil
+	}
+
+	// Simple :name (single value or slice expansion)
+	v, ok := lookup(name)
+	if !ok {
+		return 0, true, fmt.Errorf("%w: %s", ErrParamMissing, name)
+	}
+
+	// Bubble up ambiguous from fallback path only
+	if a, isAmbiguous := v.(ambiguousSentinel); isAmbiguous {
+		return 0, true, fmt.Errorf("%w: %q", ErrFieldAmbiguous, a.name)
+	}
+
+	return parseEmitValue(name, v, dialect, config, buf, args, n, k)
+}
+
+// parseEmitValue emits either a single placeholder or a list (slice/array expansion).
+func parseEmitValue(
+	name string,
+	v any,
+	dialect Dialect,
+	config Config,
+	buf *strings.Builder,
+	args *[]any,
+	n *int,
+	k int,
+) (newI int, handled bool, err error) {
+	// Single placeholder for scalar wrapper / driver.Valuer
+	if sc, ok := v.(scalar); ok {
+		if err := parseEnsureAdd(*n, 1, config); err != nil {
+			return 0, true, err
+		}
+		*n++
+		writePlaceholder(buf, dialect, *n)
+		*args = append(*args, sc.v)
+		return k, true, nil
+	}
+	if _, ok := v.(driver.Valuer); ok {
+		if err := parseEnsureAdd(*n, 1, config); err != nil {
+			return 0, true, err
+		}
+		*n++
+		writePlaceholder(buf, dialect, *n)
+		*args = append(*args, v)
+		return k, true, nil
+	}
+
+	// []byte (or byte-slice-like) → single placeholder
+	if bs, ok := v.([]byte); ok {
+		if err := parseEnsureAdd(*n, 1, config); err != nil {
+			return 0, true, err
+		}
+		*n++
+		writePlaceholder(buf, dialect, *n)
+		*args = append(*args, bs)
+		return k, true, nil
+	}
+	rv := reflect.ValueOf(v)
+	if rv.IsValid() && rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
+		if err := parseEnsureAdd(*n, 1, config); err != nil {
+			return 0, true, err
+		}
+		*n++
+		writePlaceholder(buf, dialect, *n)
+		if rv.Type() != reflect.TypeOf([]byte(nil)) && rv.Type().ConvertibleTo(reflect.TypeOf([]byte(nil))) {
+			*args = append(*args, rv.Convert(reflect.TypeOf([]byte(nil))).Interface())
+		} else {
+			*args = append(*args, v)
+		}
+		return k, true, nil
+	}
+
+	// Slice/array expansion (non-byte)
+	if (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && rv.Type().Elem().Kind() != reflect.Uint8 {
+		ln := rv.Len()
+		if ln == 0 {
+			return 0, true, fmt.Errorf("%w: %s", ErrSliceEmpty, name)
+		}
+		if err := parseEnsureAdd(*n, ln, config); err != nil {
+			return 0, true, err
+		}
+
+		parseGrowArgs(args, ln)
+		parseGrowSQL(buf, ln)
+
+		for t := 0; t < ln; t++ {
+			if t > 0 {
+				buf.WriteString(", ")
+			}
+			*n++
+			writePlaceholder(buf, dialect, *n)
+			*args = append(*args, rv.Index(t).Interface())
+		}
+		return k, true, nil
+	}
+
+	// Fallback: single placeholder
+	if err := parseEnsureAdd(*n, 1, config); err != nil {
+		return 0, true, err
+	}
+	*n++
+	writePlaceholder(buf, dialect, *n)
+	*args = append(*args, v)
+	return k, true, nil
+}
+
+// parseEmitRowsBlock emits VALUES-like tuples for :name{col1,col2,...} using rows.
+func parseEmitRowsBlock(
+	name string,
+	cols []string,
+	rows []rowVal,
+	dialect Dialect,
+	buf *strings.Builder,
+	args *[]any,
+	n *int,
+) error {
+	// Pre-compute fast-path structures (map keys and struct paths).
+	var (
+		colKeys       []reflect.Value
+		mapKeyT       reflect.Type
+		colPathByType map[reflect.Type][][]int
+	)
+
+	rv0 := deIndirect(reflect.ValueOf(rows[0]))
+	if rv0.IsValid() && rv0.Kind() == reflect.Map {
+		mapKeyT = rv0.Type().Key()
+		if mapKeyT.Kind() == reflect.String || reflect.TypeOf("").ConvertibleTo(mapKeyT) {
+			colKeys = make([]reflect.Value, len(cols))
+			for i, col := range cols {
+				kv := reflect.ValueOf(col)
+				if kv.Type() != mapKeyT && kv.Type().ConvertibleTo(mapKeyT) {
+					kv = kv.Convert(mapKeyT)
+				}
+				colKeys[i] = kv
+			}
+		}
+	}
+	if rv0.IsValid() && rv0.Kind() == reflect.Struct {
+		colPathByType = make(map[reflect.Type][][]int, 4)
+		baseT := rv0.Type()
+		baseMap := fieldIndexMap(baseT)
+		paths := make([][]int, len(cols))
+		for i, col := range cols {
+			fi, ok := baseMap[col]
+			if !ok {
+				return fmt.Errorf("%w: %q in :%s{...} (record 0)", ErrColumnNotFound, col, name)
+			}
+			if fi.ambiguous {
+				return fmt.Errorf("%w: %q in :%s{...} (record 0)", ErrFieldAmbiguous, col, name)
+			}
+			paths[i] = fi.index
+		}
+		colPathByType[baseT] = paths
+	}
+
+	need := len(rows) * len(cols)
+	parseGrowArgs(args, need)
+	parseGrowSQLRows(buf, len(cols), len(rows))
+
+	for r := 0; r < len(rows); r++ {
+		if r > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteByte('(')
+
+		rv := deIndirect(reflect.ValueOf(rows[r]))
+		useMapFast := (colKeys != nil && rv.IsValid() && rv.Kind() == reflect.Map && rv.Type().Key() == mapKeyT)
+
+		for cidx := range cols {
+			if cidx > 0 {
+				buf.WriteString(", ")
+			}
+
+			var v any
+			var ok bool
+
+			if rv.IsValid() && rv.Kind() == reflect.Struct {
+				paths, has := colPathByType[rv.Type()]
+				if !has {
+					if colPathByType == nil {
+						colPathByType = make(map[reflect.Type][][]int, 4)
+					}
+					fm := fieldIndexMap(rv.Type())
+					paths = make([][]int, len(cols))
+					for iCol, col := range cols {
+						fi, hit := fm[col]
+						if !hit {
+							return fmt.Errorf("%w: %q in :%s{...} (record %d)", ErrColumnNotFound, col, name, r)
+						}
+						if fi.ambiguous {
+							return fmt.Errorf("%w: %q in :%s{...} (record %d)", ErrFieldAmbiguous, col, name, r)
+						}
+						paths[iCol] = fi.index
+					}
+					colPathByType[rv.Type()] = paths
+				}
+				v, ok = getValueByPathAny(rv, paths[cidx])
+			} else if useMapFast {
+				mv := rv.MapIndex(colKeys[cidx])
+				if mv.IsValid() {
+					v, ok = mv.Interface(), true
+				}
+			} else {
+				v, ok = getColValue(rows[r], cols[cidx])
+			}
+
+			if !ok {
+				return fmt.Errorf("%w: %q in :%s{...} (record %d)", ErrColumnNotFound, cols[cidx], name, r)
+			}
+
+			*n++
+			writePlaceholder(buf, dialect, *n)
+			*args = append(*args, v)
+		}
+
+		buf.WriteByte(')')
+	}
+	return nil
+}
+
+// parseEnsureAdd enforces MaxParams, returning an error if the limit would be exceeded.
+func parseEnsureAdd(cur, add int, cfg Config) error {
+	if cfg.MaxParams > 0 && cur+add > cfg.MaxParams {
+		return fmt.Errorf("%w: requested=%d, limit=%d", ErrTooManyParams, cur+add, cfg.MaxParams)
+	}
+	return nil
+}
+
+// parseGrowArgs grows the args slice capacity geometrically to accommodate 'need' more items.
+func parseGrowArgs(args *[]any, need int) {
+	extra := need - (cap(*args) - len(*args))
+	if extra <= 0 {
+		return
+	}
+	// Geometric growth: double current capacity and add extra,
+	// but ensure it's at least len+need.
+	newCap := cap(*args)*2 + extra
+	minCap := len(*args) + need
+	if newCap < minCap {
+		newCap = minCap
+	}
+	na := make([]any, len(*args), newCap)
+	copy(na, *args)
+	*args = na
+}
+
+// parseGrowSQL reserves space in the SQL buffer for a slice expansion of length ln.
+func parseGrowSQL(buf *strings.Builder, ln int) {
+	// approx per placeholder + ", " separators
+	const approxPerPlaceholder = 6
+	if ln <= 0 {
+		return
+	}
+	buf.Grow(ln*approxPerPlaceholder + 2*(ln-1))
+}
+
+// parseGrowSQLRows reserves buffer space for :rows{...} expansion.
+func parseGrowSQLRows(buf *strings.Builder, numCols, numRows int) {
+	const approxPerPlaceholder = 6
+	if numCols <= 0 || numRows <= 0 {
+		return
+	}
+	need := numCols * numRows
+	perRowSep := 2 // "(" + ")"
+	if numCols > 1 {
+		perRowSep += 2 * (numCols - 1) // ", " between cols
+	}
+	extraSQL := need*approxPerPlaceholder + numRows*perRowSep
+	if numRows > 1 {
+		extraSQL += 2 * (numRows - 1) // ", " between rows
+	}
+	buf.Grow(extraSQL)
 }
 
 // writePlaceholder emits a dialect-specific placeholder token for argument idx.

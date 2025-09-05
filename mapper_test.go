@@ -973,19 +973,95 @@ func TestMapper_ScanAll_MixedCols_SomeSinks_SomeMapped(t *testing.T) {
 	}
 }
 
-// TestMapper_ScanAll_SliceOfPtrToNonStruct_Error checks that ScanAll rejects
-// destinations of type []*T where T is not a struct.
-func TestMapper_ScanAll_SliceOfPtrToNonStruct_Error(t *testing.T) {
+// TestMapper_ScanAll_SliceOfPtrToNonStruct_OK ensures that ScanAll supports
+// slices of pointers to non-struct types (e.g. []*int) and properly allocates
+// each element.
+func TestMapper_ScanAll_SliceOfPtrToNonStruct_OK(t *testing.T) {
 	db, mock := newMockDB(t)
 	defer db.Close()
 
-	// Any row (content irrelevant, error happens before Scan)
-	mock.ExpectQuery(".*").WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow(1))
+	mock.ExpectQuery(".*").
+		WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow(1).AddRow(2))
 
-	var out []*int // []*int -> elemT.Kind()==Pointer but elemT.Elem()!=Struct -> error
-	err := New(Postgres).Write("SELECT 1").ScanAll(db, &out)
-	if err == nil || !strings.Contains(err.Error(), "slice of pointers to non-struct") {
-		t.Fatalf("expected 'slice of pointers to non-struct' error, got %v", err)
+	var out []*int
+	err := New(Postgres).Write("SELECT 1 AS v UNION ALL SELECT 2").ScanAll(db, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(out))
+	}
+	if out[0] == nil || out[1] == nil {
+		t.Fatalf("expected non-nil pointers; got %v, %v", out[0], out[1])
+	}
+	if *out[0] != 1 || *out[1] != 2 {
+		t.Fatalf("unexpected values: %d, %d", *out[0], *out[1])
+	}
+}
+
+// TestMapper_ScanAll_SliceOfPtrToScanner_OK ensures that ScanAll supports
+// slices of pointers to Scanner types (e.g. []*sql.NullString), properly
+// allocating each element and handling NULLs.
+func TestMapper_ScanAll_SliceOfPtrToScanner_OK(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	mock.ExpectQuery(".*").
+		WillReturnRows(sqlmock.NewRows([]string{"v"}).AddRow("a").AddRow(nil))
+
+	var out []*sql.NullString
+	err := New(Postgres).Write("SELECT 'a' AS v UNION ALL SELECT NULL").ScanAll(db, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != 2 || out[0] == nil || out[1] == nil {
+		t.Fatalf("bad slice: %#v", out)
+	}
+	if !out[0].Valid || out[0].String != "a" {
+		t.Fatalf("unexpected first value: %#v", out[0])
+	}
+	if out[1].Valid {
+		t.Fatalf("expected second to be NULL/invalid: %#v", out[1])
+	}
+}
+
+// TestMapper_ScanAll_SliceOfStructScanner_OK ensures that ScanAll supports
+// slices of struct types that implement sql.Scanner (via *T or T) with exactly
+// one column, e.g. []sql.NullString. Each element must be allocated/filled
+// correttamente usando rows.Scan(&elem).
+func TestMapper_ScanAll_SliceOfStructScanner_OK(t *testing.T) {
+	db, mock := newMockDB(t)
+	defer db.Close()
+
+	// Due righe: una stringa e un NULL → la prima deve diventare Valid=true,
+	// la seconda Valid=false su sql.NullString.
+	mock.ExpectQuery(".*").
+		WillReturnRows(sqlmock.NewRows([]string{"v"}).
+			AddRow("a").
+			AddRow(nil))
+
+	var out []sql.NullString // <- struct, non pointer; deve entrare nel Case C
+	err := New(Postgres).
+		Write("SELECT 'a' AS v UNION ALL SELECT NULL").
+		ScanAll(db, &out)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(out) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(out))
+	}
+
+	if !out[0].Valid || out[0].String != "a" {
+		t.Fatalf("unexpected first value: %#v", out[0])
+	}
+	if out[1].Valid {
+		t.Fatalf("expected second to be NULL/invalid: %#v", out[1])
+	}
+
+	// Verifica che tutte le aspettative di sqlmock siano state soddisfatte.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 

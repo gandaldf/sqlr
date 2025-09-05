@@ -76,7 +76,13 @@ func scanOneWithPlan(rows *sql.Rows, cols []string, dstStruct reflect.Value) err
 			st.targets[i] = st.sinks[i]
 
 		case ckScanner:
-			fv := fieldByIndexAlloc(dstStruct, plan.fPath[i])
+			// Use zero-alloc fast path when no intermediate pointers exist.
+			var fv reflect.Value
+			if plan.hasPtrPath[i] {
+				fv = fieldByIndexAlloc(dstStruct, plan.fPath[i])
+			} else {
+				fv = dstStruct.FieldByIndex(plan.fPath[i])
+			}
 			ft := fv.Type()
 
 			if ft.Kind() == reflect.Pointer && ft.Implements(scannerIface) {
@@ -91,7 +97,12 @@ func scanOneWithPlan(rows *sql.Rows, cols []string, dstStruct reflect.Value) err
 			}
 
 		case ckValue:
-			fv := fieldByIndexAlloc(dstStruct, plan.fPath[i])
+			var fv reflect.Value
+			if plan.hasPtrPath[i] {
+				fv = fieldByIndexAlloc(dstStruct, plan.fPath[i])
+			} else {
+				fv = dstStruct.FieldByIndex(plan.fPath[i])
+			}
 			st.targets[i] = fv.Addr().Interface()
 
 		case ckPtr:
@@ -114,7 +125,12 @@ func scanOneWithPlan(rows *sql.Rows, cols []string, dstStruct reflect.Value) err
 	for _, i := range ptrScannerIdx {
 		raw := *(st.sinks[i].(*any))
 
-		fv := fieldByIndexAlloc(dstStruct, plan.fPath[i])
+		var fv reflect.Value
+		if plan.hasPtrPath[i] {
+			fv = fieldByIndexAlloc(dstStruct, plan.fPath[i])
+		} else {
+			fv = dstStruct.FieldByIndex(plan.fPath[i])
+		}
 		ft := fv.Type() // *T
 
 		if raw == nil {
@@ -135,8 +151,11 @@ func scanOneWithPlan(rows *sql.Rows, cols []string, dstStruct reflect.Value) err
 	return nil
 }
 
-// scanAll scans all rows into a slice. It supports slices of structs, of *struct,
-// and of primitives/Scanner types (with exactly one column).
+// scanAll scans all rows into a slice. It supports:
+//   - []T and []*T where T is struct (with column-to-field mapping)
+//   - []primitive / []Scanner (exactly one column)
+//   - []*primitive / []*Scanner (exactly one column)  // point #3
+//   - SPECIAL-CASE: T is a struct that (or whose pointer) implements sql.Scanner (exactly one column)
 func scanAll(rows *sql.Rows, dest any) error {
 	rv := reflect.ValueOf(dest)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -147,7 +166,7 @@ func scanAll(rows *sql.Rows, dest any) error {
 		return fmt.Errorf("sqlr: ScanAll requires a pointer to slice")
 	}
 
-	// Keep existing capacity (benchmarks often preallocate); just reset length.
+	// Preserve capacity if caller preallocated; reset length.
 	if rv.Len() != 0 {
 		rv.Set(rv.Slice(0, 0))
 	}
@@ -158,13 +177,110 @@ func scanAll(rows *sql.Rows, dest any) error {
 		return err
 	}
 
+	// ---------------------------------------------
+	// Case A: slice of pointers to NON-struct (primitive or Scanner)
+	// e.g. []*int64, []*sql.NullString (but NullString is a struct; handled later)
+	// ---------------------------------------------
+	if elemT.Kind() == reflect.Pointer && elemT.Elem().Kind() != reflect.Struct {
+		if len(cols) != 1 {
+			return fmt.Errorf("sqlr: ScanAll on slice of pointer-to-non-struct requires 1 column, got %d", len(cols))
+		}
+		for rows.Next() {
+			ptr := reflect.New(elemT.Elem()) // *T
+			if err := rows.Scan(ptr.Interface()); err != nil {
+				return err
+			}
+			// grow by reslice
+			l := rv.Len()
+			if l < rv.Cap() {
+				rv.Set(rv.Slice(0, l+1))
+			} else {
+				newCap := rv.Cap() * 2
+				if newCap == 0 {
+					newCap = 1
+				}
+				ns := reflect.MakeSlice(rv.Type(), l+1, newCap)
+				reflect.Copy(ns, rv)
+				rv.Set(ns)
+			}
+			rv.Index(l).Set(ptr)
+		}
+		return rows.Err()
+	}
+
+	// ---------------------------------------------
+	// Case B: slice of pointers to STRUCT that implements sql.Scanner (via *T or T)
+	// e.g. []*sql.NullString  (PointerTo(struct) implements Scanner)
+	// ---------------------------------------------
+	if elemT.Kind() == reflect.Pointer && elemT.Elem().Kind() == reflect.Struct {
+		structT := elemT.Elem()
+		if (reflect.PointerTo(structT).Implements(scannerIface) || structT.Implements(scannerIface)) && len(cols) == 1 {
+			for rows.Next() {
+				ptr := reflect.New(structT) // *T
+				// rows.Scan needs *T when Scanner has pointer receiver (e.g., *NullString)
+				if err := rows.Scan(ptr.Interface()); err != nil {
+					return err
+				}
+				// grow by reslice
+				l := rv.Len()
+				if l < rv.Cap() {
+					rv.Set(rv.Slice(0, l+1))
+				} else {
+					newCap := rv.Cap() * 2
+					if newCap == 0 {
+						newCap = 1
+					}
+					ns := reflect.MakeSlice(rv.Type(), l+1, newCap)
+					reflect.Copy(ns, rv)
+					rv.Set(ns)
+				}
+				rv.Index(l).Set(ptr)
+			}
+			return rows.Err()
+		}
+		// else: fall through to generic struct-mapping branch below
+	}
+
+	// ---------------------------------------------
+	// Case C: slice of STRUCT that implements sql.Scanner (via *T or T)
+	// e.g. []sql.NullString with 1 column
+	// ---------------------------------------------
+	if elemT.Kind() == reflect.Struct {
+		if (reflect.PointerTo(elemT).Implements(scannerIface) || elemT.Implements(scannerIface)) && len(cols) == 1 {
+			for rows.Next() {
+				// grow by reslice
+				l := rv.Len()
+				if l < rv.Cap() {
+					rv.Set(rv.Slice(0, l+1))
+				} else {
+					newCap := rv.Cap() * 2
+					if newCap == 0 {
+						newCap = 1
+					}
+					ns := reflect.MakeSlice(rv.Type(), l+1, newCap)
+					reflect.Copy(ns, rv)
+					rv.Set(ns)
+				}
+				dst := rv.Index(l)
+				// rows.Scan requires &T
+				if err := rows.Scan(dst.Addr().Interface()); err != nil {
+					return err
+				}
+			}
+			return rows.Err()
+		}
+	}
+
+	// ---------------------------------------------
+	// Generic struct / *struct mapping
+	// ---------------------------------------------
 	switch elemT.Kind() {
 	case reflect.Struct, reflect.Pointer:
-		// Support []T and []*T where T is struct
 		var structT reflect.Type
 		isPtr := elemT.Kind() == reflect.Pointer
 		if isPtr {
 			if elemT.Elem().Kind() != reflect.Struct {
+				// Should not happen due to cases above, but keep a defensive error.
 				return fmt.Errorf("sqlr: slice of pointers to non-struct")
 			}
 			structT = elemT.Elem()
@@ -178,17 +294,11 @@ func scanAll(rows *sql.Rows, dest any) error {
 		}
 		st := plan.newState()
 
-		// Precompute which paths have intermediate pointers.
-		hasPtrPath := make([]bool, len(cols))
-		for i := range cols {
-			hasPtrPath[i] = hasPtrOnPath(structT, plan.fPath[i])
-		}
-
-		// Reusable buffer for pointer-to-Scanner indices to avoid per-iter allocs.
+		// Reusable list for pointer-to-Scanner fields
 		var ptrScannerIdx []int
 
 		for rows.Next() {
-			// Grow length by 1 using reslice (avoid reflect.Append).
+			// grow by reslice
 			l := rv.Len()
 			if l < rv.Cap() {
 				rv.Set(rv.Slice(0, l+1))
@@ -204,45 +314,39 @@ func scanAll(rows *sql.Rows, dest any) error {
 			idx := l
 
 			if isPtr {
-				// []*T: create *T, scan into its Elem, then assign ptr at idx.
+				// []*T: create *T, scan into its Elem, then assign ptr
 				ptr := reflect.New(structT)
 				dst := ptr.Elem()
 
-				// Reset reusable list
-				ptrScannerIdx = ptrScannerIdx[:0]
+				ptrScannerIdx = ptrScannerIdx[:0] // reset
 
 				// Prepare targets
 				for i := range cols {
 					switch plan.kinds[i] {
 					case ckSink:
 						st.targets[i] = st.sinks[i]
-
 					case ckScanner:
 						var fv reflect.Value
-						if hasPtrPath[i] {
+						if plan.hasPtrPath[i] {
 							fv = fieldByIndexAlloc(dst, plan.fPath[i])
 						} else {
 							fv = dst.FieldByIndex(plan.fPath[i])
 						}
 						ft := fv.Type()
 						if ft.Kind() == reflect.Pointer && ft.Implements(scannerIface) {
-							// *T implements sql.Scanner -> capture raw in sink, post-process
 							st.targets[i] = st.sinks[i]
 							ptrScannerIdx = append(ptrScannerIdx, i)
 						} else {
-							// T with *T as Scanner, or T itself implements Scanner -> pass &T
 							st.targets[i] = fv.Addr().Interface()
 						}
-
 					case ckValue:
 						var fv reflect.Value
-						if hasPtrPath[i] {
+						if plan.hasPtrPath[i] {
 							fv = fieldByIndexAlloc(dst, plan.fPath[i])
 						} else {
 							fv = dst.FieldByIndex(plan.fPath[i])
 						}
 						st.targets[i] = fv.Addr().Interface()
-
 					case ckPtr:
 						h := st.holders[i]
 						h.Elem().SetZero()
@@ -260,13 +364,12 @@ func scanAll(rows *sql.Rows, dest any) error {
 				for _, i := range ptrScannerIdx {
 					raw := *(st.sinks[i].(*any))
 					var fv reflect.Value
-					if hasPtrPath[i] {
+					if plan.hasPtrPath[i] {
 						fv = fieldByIndexAlloc(dst, plan.fPath[i])
 					} else {
 						fv = dst.FieldByIndex(plan.fPath[i])
 					}
 					ft := fv.Type() // *T
-
 					if raw == nil {
 						setFieldByIndex(dst, plan.fPath[i], reflect.Zero(ft))
 						continue
@@ -282,47 +385,40 @@ func scanAll(rows *sql.Rows, dest any) error {
 					setFieldByIndex(dst, plan.fPath[i], p)
 				}
 
-				// Assign pointer at the computed index (no Append).
 				rv.Index(idx).Set(ptr)
 
 			} else {
 				// []T: scan directly into the new element.
 				dst := rv.Index(idx)
 
-				// Reset reusable list
-				ptrScannerIdx = ptrScannerIdx[:0]
+				ptrScannerIdx = ptrScannerIdx[:0] // reset
 
 				for i := range cols {
 					switch plan.kinds[i] {
 					case ckSink:
 						st.targets[i] = st.sinks[i]
-
 					case ckScanner:
 						var fv reflect.Value
-						if hasPtrPath[i] {
+						if plan.hasPtrPath[i] {
 							fv = fieldByIndexAlloc(dst, plan.fPath[i])
 						} else {
 							fv = dst.FieldByIndex(plan.fPath[i])
 						}
 						ft := fv.Type()
 						if ft.Kind() == reflect.Pointer && ft.Implements(scannerIface) {
-							// *T implements sql.Scanner -> capture raw, post-process
 							st.targets[i] = st.sinks[i]
 							ptrScannerIdx = append(ptrScannerIdx, i)
 						} else {
-							// T with *T as Scanner, or T itself implements Scanner -> pass &T
 							st.targets[i] = fv.Addr().Interface()
 						}
-
 					case ckValue:
 						var fv reflect.Value
-						if hasPtrPath[i] {
+						if plan.hasPtrPath[i] {
 							fv = fieldByIndexAlloc(dst, plan.fPath[i])
 						} else {
 							fv = dst.FieldByIndex(plan.fPath[i])
 						}
 						st.targets[i] = fv.Addr().Interface()
-
 					case ckPtr:
 						h := st.holders[i]
 						h.Elem().SetZero()
@@ -340,13 +436,12 @@ func scanAll(rows *sql.Rows, dest any) error {
 				for _, i := range ptrScannerIdx {
 					raw := *(st.sinks[i].(*any))
 					var fv reflect.Value
-					if hasPtrPath[i] {
+					if plan.hasPtrPath[i] {
 						fv = fieldByIndexAlloc(dst, plan.fPath[i])
 					} else {
 						fv = dst.FieldByIndex(plan.fPath[i])
 					}
 					ft := fv.Type() // *T
-
 					if raw == nil {
 						setFieldByIndex(dst, plan.fPath[i], reflect.Zero(ft))
 						continue
@@ -366,12 +461,12 @@ func scanAll(rows *sql.Rows, dest any) error {
 		return rows.Err()
 
 	default:
-		// Primitive/Scanner → must be 1 column
+		// Primitive/Scanner (non-struct) → must be 1 column
 		if len(cols) != 1 {
 			return fmt.Errorf("sqlr: ScanAll on slice of non-struct requires 1 column, got %d", len(cols))
 		}
 		for rows.Next() {
-			// Grow by 1 using reslice (avoid reflect.Append).
+			// grow by reslice
 			l := rv.Len()
 			if l < rv.Cap() {
 				rv.Set(rv.Slice(0, l+1))
@@ -472,9 +567,6 @@ func hasPtrOnPath(rootT reflect.Type, path []int) bool {
 
 // buildScanPlan builds an immutable scanPlan describing how each result column
 // should be scanned into the destination struct type dstT.
-// It determines, per column, whether to sink it, use sql.Scanner, treat as *T,
-// or as a plain value. For pointer fields it also records the field types
-// needed to allocate reusable **T holders in the per-scan state.
 func buildScanPlan(cols []string, dstT reflect.Type) (*scanPlan, error) {
 	// Normalize destination type (we operate on the concrete struct type).
 	for dstT.Kind() == reflect.Pointer {
@@ -489,6 +581,7 @@ func buildScanPlan(cols []string, dstT reflect.Type) (*scanPlan, error) {
 		fPath:         make([][]int, len(cols)),
 		ptrIdx:        make([]int, 0, 8),
 		ptrFieldTypes: make([]reflect.Type, len(cols)),
+		hasPtrPath:    make([]bool, len(cols)), // NEW
 	}
 
 	for i, col := range cols {
@@ -511,6 +604,8 @@ func buildScanPlan(cols []string, dstT reflect.Type) (*scanPlan, error) {
 		if reflect.PointerTo(ft).Implements(scannerIface) || ft.Implements(scannerIface) {
 			p.kinds[i] = ckScanner
 			p.fPath[i] = fi.index
+			// decide path nature once
+			p.hasPtrPath[i] = hasPtrOnPath(dstT, fi.index)
 			continue
 		}
 
@@ -520,12 +615,14 @@ func buildScanPlan(cols []string, dstT reflect.Type) (*scanPlan, error) {
 			p.fPath[i] = fi.index
 			p.ptrFieldTypes[i] = ft // keep *T to allocate **T holder in state
 			p.ptrIdx = append(p.ptrIdx, i)
+			p.hasPtrPath[i] = hasPtrOnPath(dstT, fi.index)
 			continue
 		}
 
 		// Case 3: plain value field.
 		p.kinds[i] = ckValue
 		p.fPath[i] = fi.index
+		p.hasPtrPath[i] = hasPtrOnPath(dstT, fi.index)
 	}
 
 	return p, nil
@@ -550,6 +647,7 @@ type scanPlan struct {
 	fPath         [][]int
 	ptrIdx        []int
 	ptrFieldTypes []reflect.Type // for ckPtr: field reflect.Type (which is a pointer type *T)
+	hasPtrPath    []bool         // for each column, whether the index path has intermediate pointers
 }
 
 // newState allocates per-scan buffers sized to the plan's column count.
